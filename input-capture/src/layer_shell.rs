@@ -28,6 +28,7 @@ use wayland_protocols::{
             zwp_locked_pointer_v1::ZwpLockedPointerV1,
             zwp_pointer_constraints_v1::{Lifetime, ZwpPointerConstraintsV1},
         },
+        pointer_warp::v1::client::wp_pointer_warp_v1::WpPointerWarpV1,
         relative_pointer::zv1::client::{
             zwp_relative_pointer_manager_v1::ZwpRelativePointerManagerV1,
             zwp_relative_pointer_v1::{self, ZwpRelativePointerV1},
@@ -79,6 +80,7 @@ struct Globals {
     shm: wl_shm::WlShm,
     layer_shell: ZwlrLayerShellV1,
     xdg_output_manager: ZxdgOutputManagerV1,
+    pointer_warp: Option<WpPointerWarpV1>,
 }
 
 #[derive(Clone, Debug)]
@@ -115,6 +117,7 @@ struct OutputInfo {
 struct State {
     active_positions: HashSet<Position>,
     pointer: Option<WlPointer>,
+    enter_serial: Option<u32>,
     keyboard: Option<WlKeyboard>,
     pointer_lock: Option<ZwpLockedPointerV1>,
     rel_pointer: Option<ZwpRelativePointerV1>,
@@ -148,6 +151,7 @@ struct Window {
     surface: WlSurface,
     layer_surface: ZwlrLayerSurfaceV1,
     pos: Position,
+    size: (i32, i32),
 }
 
 impl Window {
@@ -204,6 +208,7 @@ impl Window {
         surface.commit();
         Window {
             pos,
+            size,
             buffer,
             surface,
             layer_surface,
@@ -297,6 +302,16 @@ impl LayerShellInputCapture {
         let relative_pointer_manager: ZwpRelativePointerManagerV1 = global_list
             .bind(&qh, 1..=1, ())
             .map_err(|e| WaylandBindError::new(e, "zwp_relative_pointer_manager_v1"))?;
+        let pointer_warp = global_list
+            .contents()
+            .clone_list()
+            .into_iter()
+            .find(|global| global.interface.as_str() == "wp_pointer_warp_v1")
+            .map(|global| {
+                global_list
+                    .registry()
+                    .bind::<WpPointerWarpV1, _, _>(global.name, 1, &qh, ())
+            });
         let shortcut_inhibit_manager: Result<
             ZwpKeyboardShortcutsInhibitManagerV1,
             WaylandBindError,
@@ -324,8 +339,10 @@ impl LayerShellInputCapture {
                 relative_pointer_manager,
                 shortcut_inhibit_manager,
                 xdg_output_manager,
+                pointer_warp,
             },
             pointer_lock: None,
+            enter_serial: None,
             rel_pointer: None,
             shortcut_inhibitor: None,
             active_windows: Vec::new(),
@@ -430,6 +447,7 @@ impl State {
         qh: &QueueHandle<State>,
     ) {
         let window = self.focused.as_ref().unwrap();
+        self.enter_serial = Some(serial);
 
         // hide the cursor
         pointer.set_cursor(serial, None, 0, 0);
@@ -474,12 +492,30 @@ impl State {
         }
     }
 
-    fn ungrab(&mut self) {
+    fn ungrab(&mut self, offset: Option<f64>) {
         // get focused client
         let window = match self.focused.as_ref() {
             Some(focused) => focused,
             None => return,
         };
+
+        if let (Some(offset), Some(pointer_warp), Some(pointer), Some(serial)) = (
+            offset,
+            &self.globals.pointer_warp,
+            &self.pointer,
+            self.enter_serial,
+        ) {
+            let offset = offset.clamp(0.0, 1.0);
+            let (x, y) = match window.pos {
+                Position::Left | Position::Right => {
+                    (0.0, offset * f64::from(window.size.1.saturating_sub(1)))
+                }
+                Position::Top | Position::Bottom => {
+                    (offset * f64::from(window.size.0.saturating_sub(1)), 0.0)
+                }
+            };
+            pointer_warp.warp_pointer(&window.surface, pointer, x, y, serial);
+        }
 
         // ungrab surface
         window
@@ -620,10 +656,10 @@ impl Capture for LayerShellInputCapture {
         Ok(inner.flush_events()?)
     }
 
-    async fn release(&mut self) -> Result<(), CaptureError> {
+    async fn release(&mut self, offset: Option<f64>) -> Result<(), CaptureError> {
         log::debug!("releasing pointer");
         let inner = self.0.get_mut();
-        inner.state.ungrab();
+        inner.state.ungrab(offset);
         Ok(inner.flush_events()?)
     }
 
@@ -721,8 +757,8 @@ impl Dispatch<WlPointer, ()> for State {
             wl_pointer::Event::Enter {
                 serial,
                 surface,
-                surface_x: _,
-                surface_y: _,
+                surface_x,
+                surface_y,
             } => {
                 // get client corresponding to the focused surface
                 {
@@ -739,7 +775,17 @@ impl Dispatch<WlPointer, ()> for State {
                     .find(|w| w.surface == surface)
                     .map(|w| w.pos)
                     .unwrap();
-                app.pending_events.push_back((pos, CaptureEvent::Begin));
+                let window = app.focused.as_ref().expect("focused capture window");
+                let offset = match pos {
+                    Position::Left | Position::Right => surface_y / f64::from(window.size.1.max(1)),
+                    Position::Top | Position::Bottom => surface_x / f64::from(window.size.0.max(1)),
+                };
+                app.pending_events.push_back((
+                    pos,
+                    CaptureEvent::Begin {
+                        offset: Some(offset.clamp(0.0, 1.0)),
+                    },
+                ));
             }
             wl_pointer::Event::Leave { .. } => {
                 /* There are rare cases, where when a window is opened in
@@ -752,7 +798,7 @@ impl Dispatch<WlPointer, ()> for State {
                 if app.pointer_lock.is_some() {
                     log::warn!("compositor released mouse");
                 }
-                app.ungrab();
+                app.ungrab(None);
             }
             wl_pointer::Event::Button {
                 serial: _,
@@ -1011,6 +1057,7 @@ delegate_noop!(State: ZwlrLayerShellV1);
 delegate_noop!(State: ZwpRelativePointerManagerV1);
 delegate_noop!(State: ZwpKeyboardShortcutsInhibitManagerV1);
 delegate_noop!(State: ZwpPointerConstraintsV1);
+delegate_noop!(State: WpPointerWarpV1);
 
 // ignore events
 delegate_noop!(State: ignore ZxdgOutputManagerV1);

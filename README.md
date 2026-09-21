@@ -473,6 +473,7 @@ The following sections detail the emulation and capture backends provided by lan
 | X11                       |                          |                          |                          |                                        | WIP |
 
 - `layer-shell`: This backend creates a single pixel wide window on the edges of Displays to capture the cursor using the [layer-shell protocol](https://wayland.app/protocols/wlr-layer-shell-unstable-v1).
+- When the compositor supports [`wp_pointer_warp_v1`](https://wayland.app/protocols/pointer-warp-v1), the layer-shell backend restores the cursor at the corresponding position when returning from a remote device. Without that protocol, the compositor determines the cursor position after handoff.
 - `libei`: This backend uses [libei](https://gitlab.freedesktop.org/libinput/libei) and is supported by GNOME >= 45 or KDE Plasma >= 6.1.
 - `windows`: Backend for input capture on Windows.
 - `macos`: Backend for input capture on MacOS.

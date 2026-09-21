@@ -443,8 +443,20 @@ async fn do_capture_session(
                     };
                     current_pos.replace(Some(pos));
 
-                    // client entered => send event
-                    event_tx.send((pos, CaptureEvent::Begin)).await.expect("no channel");
+                    // client entered => send event, preserving the position along the barrier
+                    let offset = barriers
+                        .iter()
+                        .find(|barrier| barrier.barrier_id == barrier_id)
+                        .map(|barrier| {
+                            normalized_barrier_offset(
+                                *barrier,
+                                activated.cursor_position().expect("no cursor position reported by compositor"),
+                            )
+                        });
+                    event_tx
+                        .send((pos, CaptureEvent::Begin { offset }))
+                        .await
+                        .expect("no channel");
 
                     tokio::select! {
                         _ = notify_release.notified() => { /* capture release */
@@ -541,6 +553,16 @@ fn find_corresponding_client(barriers: &[ICBarrier], pos: (f32, f32)) -> Barrier
         .barrier_id
 }
 
+fn normalized_barrier_offset(barrier: ICBarrier, cursor: (f32, f32)) -> f64 {
+    let (x1, y1, x2, y2) = barrier.position;
+    let offset = if x1 == x2 {
+        (cursor.1 - y1 as f32) / (y2 - y1).abs().max(1) as f32
+    } else {
+        (cursor.0 - x1 as f32) / (x2 - x1).abs().max(1) as f32
+    };
+    offset.clamp(0.0, 1.0) as f64
+}
+
 fn distance_to_line(line: ((f32, f32), (f32, f32)), p: (f32, f32)) -> f32 {
     let ((x1, y1), (x2, y2)) = line;
     let (x0, y0) = p;
@@ -625,7 +647,7 @@ impl LanMouseInputCapture for LibeiInputCapture {
         Ok(())
     }
 
-    async fn release(&mut self) -> Result<(), CaptureError> {
+    async fn release(&mut self, _offset: Option<f64>) -> Result<(), CaptureError> {
         self.notify_release.notify_waiters();
         Ok(())
     }

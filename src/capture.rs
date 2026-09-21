@@ -9,7 +9,7 @@ use input_capture::{
     CaptureError, CaptureEvent, CaptureHandle, InputCapture, InputCaptureError, Position,
 };
 use input_event::{Event, KeyboardEvent, scancode};
-use lan_mouse_proto::ProtoEvent;
+use lan_mouse_proto::{ProtoEvent, decode_leave_offset};
 use local_channel::mpsc::{Receiver, Sender, channel};
 use tokio::task::{JoinHandle, spawn_local};
 use tokio_util::sync::CancellationToken;
@@ -25,7 +25,7 @@ pub(crate) struct Capture {
 
 pub(crate) enum ICaptureEvent {
     /// a client was entered
-    CaptureBegin(CaptureHandle),
+    CaptureBegin(CaptureHandle, Option<f64>),
     /// capture disabled
     CaptureDisabled,
     /// capture disabled
@@ -52,7 +52,7 @@ pub(crate) enum CaptureType {
 #[derive(Clone, Debug)]
 enum CaptureRequest {
     /// capture must release the mouse
-    Release,
+    Release(Option<f64>),
     /// add a capture client
     Create(CaptureHandle, Position, CaptureType),
     /// destory a capture client
@@ -124,9 +124,9 @@ impl Capture {
             .expect("channel closed");
     }
 
-    pub(crate) fn release(&self) {
+    pub(crate) fn release(&self, offset: Option<f64>) {
         self.request_tx
-            .send(CaptureRequest::Release)
+            .send(CaptureRequest::Release(offset))
             .expect("channel closed");
     }
 
@@ -210,7 +210,7 @@ impl CaptureTask {
                         CaptureRequest::Reenable => break,
                         CaptureRequest::Create(h, p, t) => self.add_capture(h, p, t),
                         CaptureRequest::Destroy(h) => self.remove_capture(h),
-                        CaptureRequest::Release => { /* nothing to do */ }
+                        CaptureRequest::Release(_) => { /* nothing to do */ }
                         CaptureRequest::SetReleaseBind(bind) => {
                             self.release_bind.borrow_mut().clone_from(&bind);
                         }
@@ -286,16 +286,16 @@ impl CaptureTask {
                             self.state = State::Sending;
                         }
                         // client disconnected
-                        ProtoEvent::Leave(_) => {
+                        ProtoEvent::Leave(serial) => {
                             log::info!("releasing capture: left remote client device region");
-                            self.release_capture(capture).await?;
+                            self.release_capture(capture, decode_leave_offset(serial)).await?;
                         },
                         _ => {}
                     }
                 },
                 e = self.request_rx.recv() => match e.expect("channel closed") {
                     CaptureRequest::Reenable => { /* already active */ },
-                    CaptureRequest::Release => self.release_capture(capture).await?,
+                    CaptureRequest::Release(offset) => self.release_capture(capture, offset).await?,
                     CaptureRequest::Create(h, p, t) => {
                         self.add_capture(h, p, t);
                         capture.create(h, p).await?;
@@ -324,12 +324,12 @@ impl CaptureTask {
 
         if capture.keys_pressed(&self.release_bind.borrow()) {
             log::info!("releasing capture: release-bind pressed");
-            return self.release_capture(capture).await;
+            return self.release_capture(capture, None).await;
         }
 
-        if event == CaptureEvent::Begin {
+        if let CaptureEvent::Begin { offset } = event {
             self.event_tx
-                .send(ICaptureEvent::CaptureBegin(handle))
+                .send(ICaptureEvent::CaptureBegin(handle, offset))
                 .expect("channel closed");
         }
 
@@ -339,14 +339,14 @@ impl CaptureTask {
             // we release the capture
             if !self.is_default_capture_at(self.get_pos(handle)) {
                 log::info!("releasing capture: no active client at this position");
-                capture.release().await?;
+                capture.release(None).await?;
             }
             // we dont care about events from incoming handles except for releasing the capture
             return Ok(());
         }
 
         // activated a new client
-        if event == CaptureEvent::Begin && Some(handle) != self.active_client {
+        if matches!(event, CaptureEvent::Begin { .. }) && Some(handle) != self.active_client {
             self.state = State::WaitingForAck;
             self.active_client.replace(handle);
             self.event_tx
@@ -357,7 +357,7 @@ impl CaptureTask {
         let opposite_pos = to_proto_pos(self.get_pos(handle).opposite());
 
         let event = match event {
-            CaptureEvent::Begin => ProtoEvent::Enter(opposite_pos),
+            CaptureEvent::Begin { .. } => ProtoEvent::Enter(opposite_pos),
             CaptureEvent::Input(e) => match self.state {
                 // connection not acknowledged, repeat `Enter` event
                 State::WaitingForAck => ProtoEvent::Enter(opposite_pos),
@@ -368,12 +368,16 @@ impl CaptureTask {
         if let Err(e) = self.conn.send(event, handle).await {
             const DUR: Duration = Duration::from_millis(500);
             debounce!(PREV_LOG, DUR, log::warn!("releasing capture: {e}"));
-            capture.release().await?;
+            capture.release(None).await?;
         }
         Ok(())
     }
 
-    async fn release_capture(&mut self, capture: &mut InputCapture) -> Result<(), CaptureError> {
+    async fn release_capture(
+        &mut self,
+        capture: &mut InputCapture,
+        offset: Option<f64>,
+    ) -> Result<(), CaptureError> {
         // If we have an active client, notify them we're leaving
         if let Some(handle) = self.active_client.take() {
             // Synthesize key-up events for every key still held in the
@@ -416,7 +420,7 @@ impl CaptureTask {
                 log::warn!("failed to send Leave to client {handle}: {e}");
             }
         }
-        capture.release().await
+        capture.release(offset).await
     }
 }
 
