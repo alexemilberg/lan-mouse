@@ -32,7 +32,7 @@ tokio-util = "0.7.11"
 
 [target.'cfg(all(unix, not(target_os="macos")))'.dependencies]
 wayland-client = { version = "0.31.1", optional = true }
-wayland-protocols = { version = "0.32.1", features = [
+wayland-protocols = { version = "0.32.9", features = [
     "client",
     "staging",
     "unstable",

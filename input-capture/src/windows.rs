@@ -29,7 +29,7 @@ impl Capture for WindowsInputCapture {
         Ok(())
     }
 
-    async fn release(&mut self) -> Result<(), CaptureError> {
+    async fn release(&mut self, _offset: Option<f64>) -> Result<(), CaptureError> {
         self.event_thread.release_capture();
         Ok(())
     }

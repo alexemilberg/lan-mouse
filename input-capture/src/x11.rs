@@ -23,7 +23,7 @@ impl Capture for X11InputCapture {
         Ok(())
     }
 
-    async fn release(&mut self) -> Result<(), CaptureError> {
+    async fn release(&mut self, _offset: Option<f64>) -> Result<(), CaptureError> {
         Ok(())
     }
 

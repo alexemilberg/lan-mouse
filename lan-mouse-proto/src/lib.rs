@@ -12,6 +12,24 @@ use thiserror::Error;
 /// type: u8, time: u32, dx: f64, dy: f64
 pub const MAX_EVENT_SIZE: usize = size_of::<u8>() + size_of::<u32>() + 2 * size_of::<f64>();
 
+/// Encode the normalized pointer position used by a leave event.
+/// Zero preserves the legacy leave representation and means that no position
+/// is available. Non-zero values use the remaining u32 range.
+pub fn encode_leave_offset(offset: Option<f64>) -> u32 {
+    let Some(offset) = offset else { return 0 };
+    let max = u32::MAX - 1;
+    (offset.clamp(0.0, 1.0) * f64::from(max)).round() as u32 + 1
+}
+
+/// Decode a normalized pointer position from a leave event.
+pub fn decode_leave_offset(value: u32) -> Option<f64> {
+    if value == 0 {
+        None
+    } else {
+        Some(f64::from(value.saturating_sub(1)) / f64::from(u32::MAX - 1))
+    }
+}
+
 /// error type for protocol violations
 #[derive(Debug, Error)]
 pub enum ProtocolError {
@@ -51,8 +69,9 @@ pub enum ProtoEvent {
     /// notify a client that the cursor entered its region at the given position
     /// [`ProtoEvent::Ack`] with the same serial is used for synchronization between devices
     Enter(Position),
-    /// notify a client that the cursor left its region
-    /// [`ProtoEvent::Ack`] with the same serial is used for synchronization between devices
+    /// notify a client that the cursor left its region.
+    /// The value is the position along the edge where the cursor left,
+    /// see [`encode_leave_offset`] and [`decode_leave_offset`] (`0`: no position)
     Leave(u32),
     /// acknowledge of an [`ProtoEvent::Enter`] or [`ProtoEvent::Leave`] event
     Ack(u32),
@@ -287,6 +306,26 @@ decode_impl!(u8);
 decode_impl!(u32);
 decode_impl!(i32);
 decode_impl!(f64);
+
+#[cfg(test)]
+mod tests {
+    use super::{decode_leave_offset, encode_leave_offset};
+
+    #[test]
+    fn leave_offset_round_trips() {
+        assert_eq!(decode_leave_offset(encode_leave_offset(None)), None);
+        for offset in [0.0, 0.25, 0.5, 1.0] {
+            let decoded = decode_leave_offset(encode_leave_offset(Some(offset))).unwrap();
+            assert!((decoded - offset).abs() < 1e-9);
+        }
+    }
+
+    #[test]
+    fn leave_offset_preserves_legacy_zero() {
+        assert_eq!(encode_leave_offset(None), 0);
+        assert_ne!(encode_leave_offset(Some(0.0)), 0);
+    }
+}
 
 macro_rules! encode_impl {
     ($t:ty) => {

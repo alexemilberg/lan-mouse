@@ -312,7 +312,7 @@ impl Service {
                 self.emulation_status = Status::Enabled;
                 self.notify_frontend(FrontendEvent::EmulationStatus(self.emulation_status));
             }
-            EmulationEvent::ReleaseNotify => self.capture.release(),
+            EmulationEvent::ReleaseNotify => self.capture.release(None),
             EmulationEvent::Connected { addr, fingerprint } => {
                 self.notify_frontend(FrontendEvent::DeviceConnected { addr, fingerprint });
             }
@@ -332,11 +332,11 @@ impl Service {
 
     fn handle_capture_event(&mut self, event: ICaptureEvent) {
         match event {
-            ICaptureEvent::CaptureBegin(handle) => {
+            ICaptureEvent::CaptureBegin(handle, offset) => {
                 // we entered the capture zone for an incoming connection
                 // => notify it that its capture should be released
                 if let Some(incoming) = self.incoming_conn_info.get(&handle) {
-                    self.emulation.send_leave_event(incoming.addr);
+                    self.emulation.send_leave_event(incoming.addr, offset);
                 }
             }
             ICaptureEvent::CaptureDisabled => {

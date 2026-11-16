@@ -38,7 +38,10 @@ pub type CaptureHandle = u64;
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub enum CaptureEvent {
     /// capture on this capture handle is now active
-    Begin,
+    Begin {
+        /// normalized position along the captured edge, when available
+        offset: Option<f64>,
+    },
     /// input event coming from capture handle
     Input(Event),
 }
@@ -46,7 +49,7 @@ pub enum CaptureEvent {
 impl Display for CaptureEvent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            CaptureEvent::Begin => write!(f, "begin capture"),
+            CaptureEvent::Begin { offset } => write!(f, "begin capture @ {offset:?}"),
             CaptureEvent::Input(e) => write!(f, "{e}"),
         }
     }
@@ -166,9 +169,9 @@ impl InputCapture {
     }
 
     /// release mouse
-    pub async fn release(&mut self) -> Result<(), CaptureError> {
+    pub async fn release(&mut self, offset: Option<f64>) -> Result<(), CaptureError> {
         self.pressed_keys.clear();
-        self.capture.release().await
+        self.capture.release(offset).await
     }
 
     /// Drain and return every key the capture has forwarded as
@@ -285,7 +288,7 @@ trait Capture: Stream<Item = Result<(Position, CaptureEvent), CaptureError>> + U
     async fn destroy(&mut self, pos: Position) -> Result<(), CaptureError>;
 
     /// release mouse
-    async fn release(&mut self) -> Result<(), CaptureError>;
+    async fn release(&mut self, offset: Option<f64>) -> Result<(), CaptureError>;
 
     /// destroy the input capture
     async fn terminate(&mut self) -> Result<(), CaptureError>;
