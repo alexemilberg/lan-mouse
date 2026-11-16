@@ -473,8 +473,16 @@ The following sections detail the emulation and capture backends provided by lan
 | X11                       |                          |                          |                          |                                        | WIP |
 
 - `layer-shell`: This backend creates a single pixel wide window on the edges of Displays to capture the cursor using the [layer-shell protocol](https://wayland.app/protocols/wlr-layer-shell-unstable-v1).
-- When the compositor supports [`wp_pointer_warp_v1`](https://wayland.app/protocols/pointer-warp-v1), the layer-shell backend restores the cursor at the corresponding position when returning from a remote device. Without that protocol, the compositor determines the cursor position after handoff.
 - `libei`: This backend uses [libei](https://gitlab.freedesktop.org/libinput/libei) and is supported by GNOME >= 45 or KDE Plasma >= 6.1.
 - `windows`: Backend for input capture on Windows.
 - `macos`: Backend for input capture on MacOS.
 - `x11`: TODO (not yet supported)
+
+#### Cursor Position After Handoff
+
+- The `layer-shell` and `libei` backends put a returning cursor at the matching point on the edge.
+- The remote device reports that point only if it uses the `layer-shell` or `libei` backend.
+- The point is relative to a single display, also when an edge has several displays.
+- `layer-shell` sends the point to the compositor as a pointer lock cursor hint.
+- `layer-shell` also warps the pointer with [`wp_pointer_warp_v1`](https://wayland.app/protocols/pointer-warp-v1) when the compositor supports it.
+- If the compositor ignores these requests, the compositor decides where the cursor goes.

@@ -69,8 +69,9 @@ pub enum ProtoEvent {
     /// notify a client that the cursor entered its region at the given position
     /// [`ProtoEvent::Ack`] with the same serial is used for synchronization between devices
     Enter(Position),
-    /// notify a client that the cursor left its region
-    /// [`ProtoEvent::Ack`] with the same serial is used for synchronization between devices
+    /// notify a client that the cursor left its region.
+    /// The value is the position along the edge where the cursor left,
+    /// see [`encode_leave_offset`] and [`decode_leave_offset`] (`0`: no position)
     Leave(u32),
     /// acknowledge of an [`ProtoEvent::Enter`] or [`ProtoEvent::Leave`] event
     Ack(u32),

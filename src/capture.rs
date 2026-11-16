@@ -286,9 +286,12 @@ impl CaptureTask {
                             self.state = State::Sending;
                         }
                         // client disconnected
-                        ProtoEvent::Leave(serial) => {
+                        ProtoEvent::Leave(encoded_offset) => {
                             log::info!("releasing capture: left remote client device region");
-                            self.release_capture(capture, decode_leave_offset(serial)).await?;
+                            // peers also send Leave while we are not capturing (their own pointer
+                            // reached the edge), so only an active handoff restores the cursor
+                            let offset = self.active_client.and(decode_leave_offset(encoded_offset));
+                            self.release_capture(capture, offset).await?;
                         },
                         _ => {}
                     }

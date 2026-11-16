@@ -225,6 +225,24 @@ impl Drop for Window {
     }
 }
 
+/// normalized position (0.0..=1.0) of a surface-local point along a capture window's edge
+fn edge_offset(pos: Position, size: (i32, i32), surface_x: f64, surface_y: f64) -> f64 {
+    let (along, length) = match pos {
+        Position::Left | Position::Right => (surface_y, size.1),
+        Position::Top | Position::Bottom => (surface_x, size.0),
+    };
+    (along / f64::from(length.saturating_sub(1).max(1))).clamp(0.0, 1.0)
+}
+
+/// surface-local point at a normalized position along a capture window's edge
+fn edge_position(pos: Position, size: (i32, i32), offset: f64) -> (f64, f64) {
+    let along = |length: i32| offset.clamp(0.0, 1.0) * f64::from(length.saturating_sub(1));
+    match pos {
+        Position::Left | Position::Right => (0.0, along(size.1)),
+        Position::Top | Position::Bottom => (along(size.0), 0.0),
+    }
+}
+
 fn get_edges(outputs: &[Output], pos: Position) -> Vec<(Output, i32)> {
     outputs
         .iter()
@@ -302,16 +320,8 @@ impl LayerShellInputCapture {
         let relative_pointer_manager: ZwpRelativePointerManagerV1 = global_list
             .bind(&qh, 1..=1, ())
             .map_err(|e| WaylandBindError::new(e, "zwp_relative_pointer_manager_v1"))?;
-        let pointer_warp = global_list
-            .contents()
-            .clone_list()
-            .into_iter()
-            .find(|global| global.interface.as_str() == "wp_pointer_warp_v1")
-            .map(|global| {
-                global_list
-                    .registry()
-                    .bind::<WpPointerWarpV1, _, _>(global.name, 1, &qh, ())
-            });
+        // optional: without it, the pointer lock's cursor position hint is the only way to restore the cursor
+        let pointer_warp: Option<WpPointerWarpV1> = global_list.bind(&qh, 1..=1, ()).ok();
         let shortcut_inhibit_manager: Result<
             ZwpKeyboardShortcutsInhibitManagerV1,
             WaylandBindError,
@@ -498,24 +508,19 @@ impl State {
             Some(focused) => focused,
             None => return,
         };
+        let enter_serial = self.enter_serial.take();
 
-        if let (Some(offset), Some(pointer_warp), Some(pointer), Some(serial)) = (
-            offset,
-            &self.globals.pointer_warp,
-            &self.pointer,
-            self.enter_serial,
-        ) {
-            let offset = offset.clamp(0.0, 1.0);
-            let (x, y) = match window.pos {
-                Position::Left | Position::Right => {
-                    (0.0, offset * f64::from(window.size.1.saturating_sub(1)))
-                }
-                Position::Top | Position::Bottom => {
-                    (offset * f64::from(window.size.0.saturating_sub(1)), 0.0)
-                }
-            };
-            pointer_warp.warp_pointer(&window.surface, pointer, x, y, serial);
-        }
+        // a position can arrive after the pointer was already released (e.g. by the compositor),
+        // so only restore it while the pointer is still locked
+        let restore_position = match (offset, &self.pointer_lock) {
+            (Some(offset), Some(pointer_lock)) => {
+                let (x, y) = edge_position(window.pos, window.size, offset);
+                // double-buffered: applied by the surface commit below, before the lock is destroyed
+                pointer_lock.set_cursor_position_hint(x, y);
+                Some((x, y))
+            }
+            _ => None,
+        };
 
         // ungrab surface
         window
@@ -527,6 +532,16 @@ impl State {
         if let Some(pointer_lock) = &self.pointer_lock {
             pointer_lock.destroy();
             self.pointer_lock = None;
+        }
+
+        // compositors may ignore a warp while the pointer is locked, so warp only after unlocking
+        if let (Some((x, y)), Some(pointer_warp), Some(pointer), Some(serial)) = (
+            restore_position,
+            &self.globals.pointer_warp,
+            &self.pointer,
+            enter_serial,
+        ) {
+            pointer_warp.warp_pointer(&window.surface, pointer, x, y, serial);
         }
 
         // destroy relative input
@@ -776,14 +791,11 @@ impl Dispatch<WlPointer, ()> for State {
                     .map(|w| w.pos)
                     .unwrap();
                 let window = app.focused.as_ref().expect("focused capture window");
-                let offset = match pos {
-                    Position::Left | Position::Right => surface_y / f64::from(window.size.1.max(1)),
-                    Position::Top | Position::Bottom => surface_x / f64::from(window.size.0.max(1)),
-                };
+                let offset = edge_offset(pos, window.size, surface_x, surface_y);
                 app.pending_events.push_back((
                     pos,
                     CaptureEvent::Begin {
-                        offset: Some(offset.clamp(0.0, 1.0)),
+                        offset: Some(offset),
                     },
                 ));
             }
@@ -1066,3 +1078,33 @@ delegate_noop!(State: ignore wl_buffer::WlBuffer);
 delegate_noop!(State: ignore WlSurface);
 delegate_noop!(State: ignore ZwpKeyboardShortcutsInhibitorV1);
 delegate_noop!(State: ignore ZwpLockedPointerV1);
+
+// mapping between surface-local points on a capture window and normalized edge positions
+#[cfg(test)]
+mod tests {
+    use super::{Position, edge_offset, edge_position};
+
+    #[test]
+    fn edge_offset_maps_first_and_last_pixel_to_the_ends() {
+        assert_eq!(edge_offset(Position::Left, (1, 1080), 0.0, 0.0), 0.0);
+        assert_eq!(edge_offset(Position::Left, (1, 1080), 0.0, 1079.0), 1.0);
+        assert_eq!(edge_offset(Position::Bottom, (1920, 1), 959.5, 0.0), 0.5);
+    }
+
+    #[test]
+    fn edge_position_stays_inside_the_window() {
+        assert_eq!(
+            edge_position(Position::Right, (1, 1080), 1.0),
+            (0.0, 1079.0)
+        );
+        assert_eq!(edge_position(Position::Top, (1920, 1), 0.0), (0.0, 0.0));
+        assert_eq!(edge_position(Position::Top, (1920, 1), 7.0), (1919.0, 0.0));
+    }
+
+    #[test]
+    fn edge_position_round_trips_through_edge_offset() {
+        let (x, y) = edge_position(Position::Left, (1, 1080), 0.25);
+        let offset = edge_offset(Position::Left, (1, 1080), x, y);
+        assert!((offset - 0.25).abs() < 1e-9);
+    }
+}

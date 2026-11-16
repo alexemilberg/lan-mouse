@@ -23,7 +23,7 @@ use std::{
     os::unix::net::UnixStream,
     pin::Pin,
     rc::Rc,
-    sync::{Arc, LazyLock},
+    sync::{Arc, LazyLock, Mutex},
     task::{Context, Poll},
 };
 use tokio::{
@@ -76,13 +76,34 @@ enum LibeiNotifyEvent {
     Destroy(Position),
 }
 
+/// request to release the capture, with the normalized position along the barrier to release at
+#[derive(Default)]
+struct ReleaseRequest {
+    notify: Notify,
+    offset: Mutex<Option<f64>>,
+}
+
+impl ReleaseRequest {
+    fn request(&self, offset: Option<f64>) {
+        *self.offset.lock().expect("release offset lock poisoned") = offset;
+        self.notify.notify_waiters();
+    }
+
+    fn take_offset(&self) -> Option<f64> {
+        self.offset
+            .lock()
+            .expect("release offset lock poisoned")
+            .take()
+    }
+}
+
 #[allow(dead_code)]
 pub struct LibeiInputCapture {
     input_capture: Pin<Box<InputCapture>>,
     capture_task: JoinHandle<Result<(), CaptureError>>,
     event_rx: Receiver<(Position, CaptureEvent)>,
     notify_capture: Sender<LibeiNotifyEvent>,
-    notify_release: Arc<Notify>,
+    release_request: Arc<ReleaseRequest>,
     cancellation_token: CancellationToken,
     terminated: bool,
 }
@@ -238,14 +259,14 @@ impl LibeiInputCapture {
 
         let (event_tx, event_rx) = mpsc::channel(1);
         let (notify_capture, notify_rx) = mpsc::channel(1);
-        let notify_release = Arc::new(Notify::new());
+        let release_request = Arc::new(ReleaseRequest::default());
 
         let cancellation_token = CancellationToken::new();
 
         let capture = do_capture(
             input_capture_ptr,
             notify_rx,
-            notify_release.clone(),
+            release_request.clone(),
             first_session,
             event_tx,
             cancellation_token.clone(),
@@ -257,7 +278,7 @@ impl LibeiInputCapture {
             event_rx,
             capture_task,
             notify_capture,
-            notify_release,
+            release_request,
             cancellation_token,
             terminated: false,
         };
@@ -269,7 +290,7 @@ impl LibeiInputCapture {
 async fn do_capture(
     input_capture: *const InputCapture,
     mut capture_event: Receiver<LibeiNotifyEvent>,
-    notify_release: Arc<Notify>,
+    release_request: Arc<ReleaseRequest>,
     session: Option<(Session<InputCapture>, BitFlags<Capabilities>)>,
     event_tx: Sender<(Position, CaptureEvent)>,
     cancellation_token: CancellationToken,
@@ -327,7 +348,7 @@ async fn do_capture(
                 &event_tx,
                 &active_clients,
                 &mut next_barrier_id,
-                &notify_release,
+                &release_request,
                 (cancel_session.clone(), cancel_update.clone()),
             );
 
@@ -370,7 +391,7 @@ async fn do_capture_session(
     event_tx: &Sender<(Position, CaptureEvent)>,
     active_clients: &[Position],
     next_barrier_id: &mut NonZeroU32,
-    notify_release: &Notify,
+    release_request: &ReleaseRequest,
     cancel: (CancellationToken, CancellationToken),
 ) -> Result<(), CaptureError> {
     let (cancel_session, cancel_update) = cancel;
@@ -444,38 +465,39 @@ async fn do_capture_session(
                     current_pos.replace(Some(pos));
 
                     // client entered => send event, preserving the position along the barrier
-                    let offset = barriers
+                    let barrier = barriers
                         .iter()
                         .find(|barrier| barrier.barrier_id == barrier_id)
-                        .map(|barrier| {
-                            normalized_barrier_offset(
-                                *barrier,
-                                activated.cursor_position().expect("no cursor position reported by compositor"),
-                            )
-                        });
+                        .copied();
+                    let offset = barrier
+                        .zip(activated.cursor_position())
+                        .map(|(barrier, cursor)| normalized_barrier_offset(barrier, cursor));
                     event_tx
                         .send((pos, CaptureEvent::Begin { offset }))
                         .await
                         .expect("no channel");
 
-                    tokio::select! {
-                        _ = notify_release.notified() => { /* capture release */
+                    let release_offset = tokio::select! {
+                        _ = release_request.notify.notified() => { /* capture release */
                             log::debug!("release session requested");
+                            release_request.take_offset()
                         },
                         _ = release_session.notified() => { /* release session */
                             log::debug!("ei devices changed");
                             ei_devices_changed = true;
+                            None
                         },
                         _ = cancel_session.cancelled() => { /* kill session notify */
                             log::debug!("session cancel requested");
                             break
                         },
-                    }
+                    };
 
-                    release_capture(input_capture, session, activated, pos).await?;
+                    let release_at = barrier.zip(release_offset);
+                    release_capture(input_capture, session, activated, pos, release_at).await?;
 
                 }
-                _ = notify_release.notified() => { /* capture release -> we are not capturing anyway, so ignore */
+                _ = release_request.notify.notified() => { /* capture release -> we are not capturing anyway, so ignore */
                     log::debug!("release session requested");
                 },
                 _ = release_session.notified() => { /* release session */
@@ -516,6 +538,7 @@ async fn release_capture(
     session: &Session<InputCapture>,
     activated: Activated,
     current_pos: Position,
+    release_at: Option<(ICBarrier, f64)>,
 ) -> Result<(), CaptureError> {
     if let Some(activation_id) = activated.activation_id() {
         log::debug!("releasing input capture {activation_id}");
@@ -524,6 +547,10 @@ async fn release_capture(
         .cursor_position()
         .expect("compositor did not report cursor position!");
     log::debug!("client entered @ ({x}, {y})");
+    let (x, y) = match release_at {
+        Some((barrier, offset)) => position_along_barrier(barrier, (x, y), offset),
+        None => (x, y),
+    };
     let (dx, dy) = match current_pos {
         // offset cursor position to not enter again immediately
         Position::Left => (1., 0.),
@@ -561,6 +588,17 @@ fn normalized_barrier_offset(barrier: ICBarrier, cursor: (f32, f32)) -> f64 {
         (cursor.0 - x1 as f32) / (x2 - x1).abs().max(1) as f32
     };
     offset.clamp(0.0, 1.0) as f64
+}
+
+/// moves the cursor to a normalized position along the barrier, keeping its distance from it
+fn position_along_barrier(barrier: ICBarrier, cursor: (f32, f32), offset: f64) -> (f32, f32) {
+    let (x1, y1, x2, y2) = barrier.position;
+    let offset = offset.clamp(0.0, 1.0) as f32;
+    if x1 == x2 {
+        (cursor.0, y1 as f32 + offset * (y2 - y1) as f32)
+    } else {
+        (x1 as f32 + offset * (x2 - x1) as f32, cursor.1)
+    }
 }
 
 fn distance_to_line(line: ((f32, f32), (f32, f32)), p: (f32, f32)) -> f32 {
@@ -647,8 +685,8 @@ impl LanMouseInputCapture for LibeiInputCapture {
         Ok(())
     }
 
-    async fn release(&mut self, _offset: Option<f64>) -> Result<(), CaptureError> {
-        self.notify_release.notify_waiters();
+    async fn release(&mut self, offset: Option<f64>) -> Result<(), CaptureError> {
+        self.release_request.request(offset);
         Ok(())
     }
 
@@ -687,5 +725,36 @@ impl Stream for LibeiInputCapture {
             },
             Poll::Pending => self.event_rx.poll_recv(cx).map(|e| e.map(Result::Ok)),
         }
+    }
+}
+
+// geometry for measuring and restoring the cursor position along a pointer barrier
+#[cfg(test)]
+mod tests {
+    use std::num::NonZeroU32;
+
+    use super::{ICBarrier, normalized_barrier_offset, position_along_barrier};
+
+    fn barrier(position: (i32, i32, i32, i32)) -> ICBarrier {
+        ICBarrier::new(NonZeroU32::new(1).expect("non-zero id"), position)
+    }
+
+    #[test]
+    fn normalized_barrier_offset_measures_along_the_barrier() {
+        let left = barrier((0, 0, 0, 1079));
+        let bottom = barrier((0, 1080, 1919, 1080));
+        assert_eq!(normalized_barrier_offset(left, (0.0, 539.5)), 0.5);
+        assert_eq!(normalized_barrier_offset(bottom, (1919.0, 1079.0)), 1.0);
+    }
+
+    #[test]
+    fn position_along_barrier_keeps_the_distance_from_the_barrier() {
+        let right = barrier((1920, 0, 1920, 1079));
+        let top = barrier((0, 0, 1919, 0));
+        assert_eq!(
+            position_along_barrier(right, (1919.0, 100.0), 0.75),
+            (1919.0, 809.25)
+        );
+        assert_eq!(position_along_barrier(top, (500.0, 0.0), 0.5), (959.5, 0.0));
     }
 }
